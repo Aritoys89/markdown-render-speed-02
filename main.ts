@@ -1,33 +1,31 @@
-// Entry driver for the markdown-render-speed-02 competition.
+// Driver for the markdown-render-speed-02 entry.
 //
-// Reads every case from cases.json in the input directory, renders each
-// case's markdown with the parser in parse.js, and writes the resulting
-// HTML strings, in case order, as a JSON array to html.json in the output
-// directory. The directories default to /input and /output and can be
-// overridden with the MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR environment
-// variables (the kit harness uses those for local runs).
+// The harness runs `node /bot/main.ts` in a sandbox with a read-only /input
+// holding cases.json and a writable /output. We render every case with the
+// local parse() and write the HTML strings back in the cases' order.
+//
+// The input and output locations can be overridden with MAKEFUN_INPUT_DIR
+// and MAKEFUN_OUTPUT_DIR (that is how the kit's local harness points the
+// driver at the practice set); they default to /input and /output.
+//
+// Nothing here is timed or random: the same input always produces the same
+// output file, byte for byte, which the grader requires of both runs.
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { parse } from './parse.js';
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-// @ts-ignore -- parse.js is a plain ES module next to this file.
-import { parse } from "./parse.js";
+const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
+const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const INPUT_PATH = join(inputDir, 'cases.json');
+const OUTPUT_PATH = join(outputDir, 'html.json');
 
-interface Case {
-  id: string;
-  markdown: string;
-}
+const rawCases = readFileSync(INPUT_PATH, 'utf8');
+const cases = JSON.parse(rawCases);
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR ?? "/input";
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-
-const cases = JSON.parse(
-  readFileSync(join(inputDir, "cases.json"), "utf8"),
-) as Case[];
-
-const html: string[] = new Array(cases.length);
-for (let k = 0; k < cases.length; k++) {
-  html[k] = parse(cases[k].markdown);
+const rendered = new Array(cases.length);
+for (let i = 0; i < cases.length; i++) {
+  rendered[i] = parse(cases[i].markdown);
 }
 
 mkdirSync(outputDir, { recursive: true });
-writeFileSync(join(outputDir, "html.json"), JSON.stringify(html));
+writeFileSync(OUTPUT_PATH, JSON.stringify(rendered));
