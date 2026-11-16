@@ -279,6 +279,49 @@ function htmlBlockEnd(cond, line) {
   }
 }
 
+/** Marked's htmlBeginRegex test on a line whose leading spaces have been
+ *  stripped: a block-level HTML beginning (list-item gathering breaks). */
+function htmlBeginTest(t) {
+  if (t.startsWith('<!--') || t.startsWith('<?') || t.startsWith('<![CDATA[')) return true;
+  if (/^<![A-Za-z]/.test(t)) return true;
+  const m = /^<(\/?)([A-Za-z][A-Za-z0-9-]*)/.exec(t);
+  if (!m) return false;
+  const tag = m[2].toLowerCase();
+  const after = t.slice(m[0].length);
+  if (m[1] === '' && (tag === 'script' || tag === 'pre' || tag === 'style' || tag === 'textarea')) {
+    return after === '' || after[0] === '>' || after[0] === ' ' || after[0] === '\t';
+  }
+  if (HTML_BLOCK_TAGS.has(tag)) {
+    return after === '' || after[0] === ' ' || after[0] === '>' || after.startsWith('/>');
+  }
+  return false;
+}
+
+/** Marked's item-gathering "begin" tests (fencesBegin / headingBegin /
+ *  htmlBegin / blockquoteBegin / nextBullet / hr, each allowing at most n
+ *  leading spaces) on one line of an item's parent text. The lazy-branch
+ *  variant tests only fence / heading / html / hr against the previous
+ *  gathered line. */
+function beginBreakTest(s, n, lazyOnly) {
+  let lead = 0;
+  while (lead < s.length && s[lead] === ' ') lead++;
+  if (lead > n) return false;
+  const t = s.slice(lead);
+  if (t.startsWith('```') || t.startsWith('~~~')) return true;
+  if (/^#{1,6}(?:[ \t]|$)/.test(t)) return true;
+  if (htmlBeginTest(t)) return true;
+  if (RE_HR.test(t)) return true;
+  if (!lazyOnly) {
+    if (t[0] === '>') return true;
+    const m = /^(?:[*+-]|\d{1,9}[.)])/.exec(t);
+    if (m) {
+      const a = t.slice(m[0].length);
+      if (a === '' || a[0] === ' ' || a[0] === '\t') return true;
+    }
+  }
+  return false;
+}
+
 // GFM table helpers ---------------------------------------------------------
 
 function splitTableRow(line) {
@@ -344,6 +387,10 @@ function parseBlocks(src) {
   const tip = () => stack[stack.length - 1];
 
   function finalize(b) {
+    // Marked leaks its "top" lexer state out of a list: once a nested
+    // list token completes inside an item, the rest of that item is lexed
+    // with paragraph tokens (verbatim lines) instead of text assembly.
+    if (b.type === 'list' && b.parent && b.parent.type === 'item') b.parent.topLeaked = true;
     if (b.type === 'code' && !b.fenced) {
       let trimmed = false;
       while (b.lines.length && isBlankText(b.lines[b.lines.length - 1])) { b.lines.pop(); trimmed = true; }
@@ -452,6 +499,79 @@ function parseBlocks(src) {
     return blanks + (srcEndsNl ? 1 : 0) === 1;
   }
 
+  /** The remainder of `line` after mechanically matching the container
+   *  stack up to index uptoIdx (phase 1 rules, no gathering tests), or
+   *  null when a container fails to match. */
+  function levelRest(line, uptoIdx) {
+    const st = makeState(line);
+    for (let si = 1; si <= uptoIdx; si++) {
+      const b = stack[si];
+      if (b.type === 'blockquote') {
+        const colBefore = st.col;
+        advanceIndent(st, 3);
+        if (st.partialTab === 0 && st.line[st.pos] === '>') {
+          const leadCols = st.col - colBefore;
+          st.pos++; st.col++;
+          quoteSepExpand(st, leadCols);
+        } else return null;
+      } else if (b.type === 'item') {
+        if (b.deadEmpty) return null;
+        const beforeCol = st.col;
+        advanceIndent(st, b.indent);
+        if (st.col - beforeCol >= b.indent || isBlankText(remainderText(st))) { /* matched */ }
+        else return null;
+      } else if (b.type !== 'list') {
+        return null;
+      }
+    }
+    return remainderText(st);
+  }
+
+  /** Whether marked's list-item gathering would still include source line
+   *  li in every list item enclosing the fenced code block at the stack
+   *  tip, given that phase 1 matched containers only up to lastMatched.
+   *  Mirrors the gathering loop of marked's list tokenizer per item:
+   *  begin-breaks on the line, indent inclusion, and the lazy branch
+   *  (rejected when the previous gathered line was blank, is indented
+   *  code, or itself begins a fence / heading / HTML block / hr). A failed
+   *  block quote anywhere above the fence ends it (its text is gathered
+   *  from '>'-marked lines only). */
+  function fenceGatherOk(li, lastMatched, restNow) {
+    const top = stack.length - 1;
+    for (let si = lastMatched + 1; si < top; si++) if (stack[si].type === 'blockquote') return false;
+    let prevText = levelRest(lines[li - 1], lastMatched);
+    if (prevText === null) return false;
+    let curText = restNow;
+    for (let si = lastMatched + 1; si < top; si++) {
+      const b = stack[si];
+      if (b.type !== 'item') continue; // lists are transparent
+      const R = b.indent;
+      const n = Math.max(0, Math.min(3, R - 1));
+      // The previous gathered line's form inside this item's text.
+      let prevForm; let prevBlank;
+      if (b.firstLine === li - 1) {
+        prevForm = b.firstText || '';
+        prevBlank = isBlankText(prevForm);
+      } else {
+        prevBlank = isBlankText(prevText);
+        const zp = expandLeadTab(prevText, 0);
+        prevForm = (prevBlank || zp.search(/[^ ]/) >= R) ? zp.slice(R) : prevText;
+      }
+      if (beginBreakTest(curText, n, false)) return false;
+      const z = expandLeadTab(curText, 0);
+      if (z.search(/[^ ]/) >= R || isBlankText(curText)) {
+        curText = z.slice(R);
+      } else {
+        if (prevBlank) return false;
+        if (prevForm.replace(/\t/g, '    ').search(/[^ ]/) >= 4) return false;
+        if (beginBreakTest(prevForm, n, true)) return false;
+        // Lazy inclusion: the line enters the item text verbatim.
+      }
+      prevText = prevForm;
+    }
+    return true;
+  }
+
   for (let li = 0; li < lines.length; li++) {
     const rawLine = lines[li];
     const st = makeState(rawLine);
@@ -499,17 +619,74 @@ function parseBlocks(src) {
     const restNow = remainderText(st);
     const blank = isBlankText(restNow);
 
+    // A stashed whitespace-only line in a block quote (see the
+    // blank-line handler) is resolved by this line: if the quote still
+    // matched, its text continues past the stashed line, so the line
+    // was a space that ended the paragraph; if the quote failed to
+    // match, its text ended at the stashed line and the line joins.
+    if (cur.type === 'paragraph' && cur.wsStash !== undefined && !blank) {
+      const quoteIdx = stack.indexOf(cur.parent);
+      if (lastMatched >= quoteIdx) {
+        cur.wsStash = undefined;
+        finalize(stack.pop());
+        li--;
+        continue;
+      }
+      cur.lines.push(cur.wsStash);
+      cur.wsStash = undefined;
+    }
+
+    // Deferred code-tail handling: a paragraph in a list item whose last
+    // line entered as a merged indented-code token (marked assembles
+    // item paragraphs from text/code token merges) interacts with the
+    // lines that follow it in specific ways:
+    // - Blank lines after the code line are stashed (see the blank-line
+    //   handler): they join the paragraph only if another code line
+    //   follows; with exactly one blank and the item text ending there,
+    //   the code token still contributes a trailing newline; with two
+    //   or more, it contributes nothing extra.
+    // - A non-blank line that belongs to the item text right after the
+    //   code line (no blank between) also leaves a trailing newline in
+    //   the paragraph text (the code token's raw ends with one).
+    if (cur.type === 'paragraph' && (cur.codeBlanks || cur.codeTail) && !blank) {
+      let itemIdx = -1;
+      for (let b = cur.parent; b; b = b.parent) {
+        if (b.type === 'list') continue;
+        if (b.type === 'item') itemIdx = stack.indexOf(b);
+        break;
+      }
+      const belongs = itemIdx >= 0 && lastMatched >= itemIdx;
+      if (cur.codeBlanks) {
+        if (allMatched && measureIndent(st).cols >= 4) {
+          for (const b of cur.codeBlanks) cur.lines.push(b);
+          cur.codeBlanks = null;
+        } else {
+          // With exactly one blank and the item text ending there, the
+          // code token's trailing newline survives — but only when the
+          // item is not the list's last (marked trims the last item's
+          // text). Defer: flag the paragraph; the flag is applied if a
+          // sibling item is added to the same list.
+          if (cur.codeBlanks.length === 1 && !belongs) cur.codeNlCandidate = true;
+          cur.codeBlanks = null;
+          finalize(stack.pop());
+          li--;
+          continue;
+        }
+      } else if (cur.codeTail && belongs && !(allMatched && measureIndent(st).cols >= 4)) {
+        cur.lines.push('');
+        cur.codeTail = false;
+      }
+    }
+
     // Leaf blocks that continue by content: fenced/indented code, HTML, table.
     if (cur.type === 'code' || cur.type === 'html' || cur.type === 'table') {
-      // A fenced code block keeps consuming lines when the first unmatched
-      // container is a list item, but not across a block quote boundary.
-      // Inside a list item it only runs on once a non-blank content line
-      // has been consumed with the item fully matched ("established"):
-      // marked's item gathering otherwise ends the item at that line,
-      // leaving the fence unclosed inside the item.
-      const fenceRunsOn = cur.type === 'code' && cur.fenced && cur.established &&
-        stack[lastMatched + 1] && stack[lastMatched + 1].type === 'item' &&
-        !stack.slice(lastMatched + 1, -1).some((b) => b.type === 'blockquote');
+      // A fenced code block keeps consuming lines while every list item
+      // enclosing it would still gather the line into its text (marked
+      // gathers item text line by line before lexing it, so the fence
+      // inside ends exactly where the gathering of some enclosing item
+      // ends); a failed block quote always ends it.
+      const fenceRunsOn = cur.type === 'code' && cur.fenced && !allMatched &&
+        fenceGatherOk(li, lastMatched, restNow);
       if (!allMatched && !fenceRunsOn) {
         closeBlocks(lastMatched);
         cur = tip();
@@ -579,7 +756,13 @@ function parseBlocks(src) {
         // non-blank line is another row.
         const stripped = restNow.replace(/^ {0,3}/, '');
         let starts = false;
-        if (stripped[0] === '>' || RE_ATX.test(stripped) || RE_HR.test(stripped) || htmlBlockStart(stripped, false)) {
+        if (!blank && (/^ {4}/.test(restNow) || /^ {0,3}\t/.test(restNow))) {
+          // Marked's table token does not extend over an indented
+          // line (four spaces, or a tab within the first three) that
+          // has content after the indent.
+          starts = true;
+        } else if (stripped[0] === '>' || RE_ATX.test(stripped) || RE_HR.test(stripped) ||
+            (stripped[0] === '<' && htmlBeginTest(stripped.replace(/^ {0,3}/, '')))) {
           starts = true;
         } else {
           const fm = RE_FENCE.exec(stripped);
@@ -600,6 +783,47 @@ function parseBlocks(src) {
 
     // Blank lines close an open paragraph; containers stay open.
     if (blank && cur.type !== 'code' && cur.type !== 'html') {
+      if (cur.type === 'paragraph' && cur.wsStash !== undefined) {
+        // A blank line after a stashed whitespace-only line (below):
+        // just count it; the next non-blank line or end of input
+        // resolves the stash.
+        cur.wsAfter = (cur.wsAfter || 0) + 1;
+        continue;
+      }
+      if (cur.type === 'paragraph' && restNow !== '' && cur.parent && cur.parent.type === 'blockquote' && /^\s*>/.test(lines[li])) {
+        // A whitespace-only but non-empty line in a block quote:
+        // marked's paragraph tokenizer consumes it as a paragraph line
+        // only when it is the last line of the quote's text; otherwise
+        // it is a space that ends the paragraph. Stash it and let the
+        // next line decide (see the decision point after Phase 1).
+        let inItem = false;
+        for (let b = cur.parent; b; b = b.parent) if (b.type === 'item') { inItem = true; break; }
+        if (!inItem) { cur.wsStash = restNow; continue; }
+      }
+      if (cur.type === 'paragraph' && cur.codeTail && allMatched) {
+        // Marked assembles an item paragraph line by line (its block
+        // lexer runs with top=false inside items): a line indented 4+
+        // is an indented-code token merged into the paragraph text, and
+        // such a token's raw spans the blank lines that follow it when
+        // another indented line comes next — but its text is trimmed of
+        // trailing blank lines, so the blanks join the paragraph only
+        // if a code-continuation line actually follows. Stash them on
+        // the paragraph; the next line decides (see the decision point
+        // after Phase 1).
+        let inItem = false;
+        for (let b = cur.parent; b; b = b.parent) {
+          if (b.type === 'list') continue;
+          inItem = b.type === 'item';
+          break;
+        }
+        if (inItem) {
+          let ws = leadExpand(restNow, st);
+          ws = ws.replace(/^ {1,4}/, '');
+          (cur.codeBlanks ??= []).push(ws);
+          cur.lastLineBlank = true;
+          continue;
+        }
+      }
       if (cur.type === 'paragraph' && li === lines.length - 1 && restNow !== '') {
         // A whitespace-only final line joins the paragraph (marked quirk).
         cur.lines.push(restNow);
@@ -787,6 +1011,17 @@ function parseBlocks(src) {
             list.listData = { bullet: lm.bullet, char: lm.bullet ? lm.bchar : lm.dchar, start: lm.start, tight: true };
             stack.push(list);
           }
+          // A previous item whose paragraph ended on a code line plus
+          // exactly one blank gets its deferred trailing newline now
+          // that the item turns out not to be the list's last.
+          const prevItem = list.children[list.children.length - 1];
+          if (prevItem) {
+            const lastChild = prevItem.children[prevItem.children.length - 1];
+            if (lastChild && lastChild.type === 'paragraph' && lastChild.codeNlCandidate) {
+              lastChild.lines.push('');
+              lastChild.codeNlCandidate = false;
+            }
+          }
           const item = addChild(list, newBlock('item'));
           item.indent = lm.contentIndent;
           stack.push(item); container = item;
@@ -798,6 +1033,8 @@ function parseBlocks(src) {
             st.pos = lm.contentPos; st.col = lm.contentCol;
             st.partialTab = 0;
           }
+          item.firstLine = li;
+          item.firstText = lm.blankAfter ? '' : remainderText(st);
           if (lm.blankAfter) { consumedLine = true; }
           // If the rest of the line is blank, the item simply stays empty.
           if (isBlankText(remainderText(st))) { consumedLine = true; break; }
@@ -833,7 +1070,7 @@ function parseBlocks(src) {
       let inItemPara = false;
       for (let b = cur.parent; b; b = b.parent) {
         if (b.type === 'list') continue;
-        inItemPara = b.type === 'item';
+        inItemPara = b.type === 'item' && !b.topLeaked;
         break;
       }
       if (inItemPara) {
@@ -845,23 +1082,44 @@ function parseBlocks(src) {
           for (let si = lastMatched + 1; si < stack.length; si++) if (stack[si].type === 'blockquote') { hasQuote = true; break; }
           if (hasQuote) txt = '    ' + txt.replace(/^ +/, '');
         }
+        // A text line joining right after a merged code line leaves the
+        // code token's trailing newline behind (an empty line in the
+        // paragraph text); the decision point after Phase 1 covers the
+        // matched case, this covers a lazy line.
+        if (cur.codeTail && !cur.codeBlanks && measureIndent(st).cols < 4) cur.lines.push('');
         cur.lines.push(txt);
+        // Whether this line entered the paragraph as a merged indented
+        // code token (4+ columns in the item's text): a following blank
+        // line is then absorbed into the paragraph instead of ending it.
+        cur.codeTail = measureIndent(st).cols >= 4;
         continue;
       }
       let lazyText = remainderText(stL);
       let lazySt = stL;
+      // Whether this line is lazy for an enclosing block quote (it failed
+      // to match one). Marked lexes a block quote in segments: a segment
+      // break happens where a '>' line follows a non-'>' line or the other
+      // way round, so a lazy line only starts a new segment when the
+      // previous paragraph line was matched.
+      let quoteLazy = false;
       if (!allMatched) {
-        // Marked strips 4 columns from a deeply indented lazy line when a
-        // block quote among the unmatched containers is being continued.
-        let hasQuote = false;
-        for (let si = lastMatched + 1; si < stack.length; si++) if (stack[si].type === 'blockquote') { hasQuote = true; break; }
-        if (hasQuote && measureIndent(stL).cols >= 4) {
-          const stQ = { line: stL.line, pos: stL.pos, col: stL.col, partialTab: stL.partialTab };
-          advanceIndent(stQ, 4);
-          lazyText = remainderText(stQ);
-          lazySt = stQ;
-        }
+        for (let si = lastMatched + 1; si < stack.length; si++) if (stack[si].type === 'blockquote') { quoteLazy = true; break; }
       }
+      if (quoteLazy && (cur.quoteCodeNl || !cur.prevLazy) && measureIndent(stL).cols >= 4) {
+        // A lazy segment is lexed on its own, so a lazy line indented 4+
+        // in the quote's text forms an indented code token there, which
+        // then merges into the open paragraph with its text dedented —
+        // and keeps its trailing newline, so the next paragraph line
+        // lands after a blank line.
+        const stQ = { line: stL.line, pos: stL.pos, col: stL.col, partialTab: stL.partialTab };
+        advanceIndent(stQ, 4);
+        cur.lines.push(remainderText(stQ));
+        cur.quoteCodeNl = true;
+        cur.prevLazy = true;
+        continue;
+      }
+      if (cur.quoteCodeNl) { cur.lines.push(''); cur.quoteCodeNl = false; }
+      cur.prevLazy = quoteLazy;
       if (stack.length > 2) lazyText = leadExpand(lazyText, lazySt);
       if (!allMatched && cur.lines.length >= 2 && /^ {0,3}(=+|-+)[ \t]*$/.test(lazyText)) {
         // A lazy setext-underline line joining a multi-line paragraph inside
@@ -905,6 +1163,16 @@ function parseBlocks(src) {
   // Only a top-level block's text keeps the source's final newline; inside
   // a container the slice ends with the block's last line itself.
   for (const b of stack) if (b.type === 'html') b.eofEnd = b.parent && b.parent.type === 'document' ? srcEndsNl : false;
+  // A paragraph ending the input with stashed code-tail blanks just
+  // drops them: the item is the list's last, and marked trims the last
+  // item's text, so the code token contributes no trailing newline.
+  {
+    const t = tip();
+    if (t.type === 'paragraph' && t.codeBlanks) t.codeBlanks = null;
+    // A stashed whitespace-only line at end of input is the quote
+    // text's last line: it joins the paragraph.
+    if (t.type === 'paragraph' && t.wsStash !== undefined) { t.lines.push(t.wsStash); t.wsStash = undefined; }
+  }
   closeBlocks(0);
   return root;
 }
@@ -1445,11 +1713,14 @@ function linkInText(s, refs) {
       if (rl) {
         const lab = rl.label === '' ? labelText : rl.label;
         if (refs.has(normalizeLabel(lab))) return true;
-        p = rl.end; continue;
+        // Not a link: keep scanning inside the construct — a nested
+        // bracket may still hold a link (marked's scan finds matches at
+        // every position).
+        p++; continue;
       }
     }
     if (refs.has(normalizeLabel(labelText))) return true;
-    p = le + 1;
+    p++;
   }
   return false;
 }
@@ -1710,7 +1981,10 @@ function emStrongAttempt(text, masked, lastClosers, pos, prevCharIn) {
   if (d && prevChar !== '' && !u) return null;
   const k = runLen;
   const y = pos - l + k;
-  const sameChar = prevChar === r;
+  // Marked's same-char flag uses the character actually preceding this
+  // attempt's position (an attempt starting mid-run after a failed one
+  // sees the run's own character), not the character before the run.
+  const sameChar = prevCharIn === r;
   const R = p !== '' && !isWsC(p) && (!!d || (r === '*' && !h));
   const Q = pos + k;
   const v = lastClosers[r];
@@ -1763,6 +2037,11 @@ function parseInlineNodes(text, refs, ctx) {
   // <a ...> tag suppresses extended autolinks from that point on, for the
   // rest of the document, until an inline </a> appears. ctx carries it.
   let inLink = ctx ? ctx.inLink : false;
+  // Marked's inRawBlock state: an inline <pre>/<code>/<kbd>/<script> start
+  // tag makes following inline text render verbatim (no entity decoding,
+  // no escaping) until the matching end tag. It resets for every block's
+  // inline run, but is shared with nested runs (emphasis, link labels).
+  let rawBlock = ctx ? !!ctx.rawBlock : false;
   function push(node) {
     node.prev = tail; node.next = -1; node.parent = -1; node.gone = false;
     nd.push(node);
@@ -1826,7 +2105,7 @@ function parseInlineNodes(text, refs, ctx) {
   let bufStart = 0;
   function flush() {
     if (buf !== '') {
-      push({ k: 'text', s: buf, src: bufStart, srcLen: i - bufStart, il: inLink });
+      push({ k: 'text', s: buf, src: bufStart, srcLen: i - bufStart, il: inLink, raw: rawBlock });
       buf = '';
     }
   }
@@ -1839,10 +2118,24 @@ function parseInlineNodes(text, refs, ctx) {
       const nx = text[i + 1];
       if (nx === '\n') {
         // A backslash at the end of a line is part of an extended
-        // autolink when a URL is in progress in the current text run.
-        const um = /(?:https?:\/\/|ftp:\/\/|www\.)[^\s]*$/.exec(buf);
-        if (um && (um.index === 0 || isAutolinkBoundary(buf[um.index - 1]))) {
-          buf += ch; i++; continue;
+        // autolink when a URL is in progress in the current text run —
+        // unless the autolink pass will skip this run (marked's leaked
+        // inLink state suppresses the url tokeniser, and the backslash
+        // then forms a hard break instead).
+        if (!inLink) {
+          let runText = buf;
+          let runStart = bufStart;
+          for (let c = tail; c !== -1 && runText.length <= 2048; c = nd[c].prev) {
+            const ndn = nd[c];
+            if (ndn.k === 'text' && !ndn.esc && !ndn.il && ndn.src !== undefined) { runText = ndn.s + runText; runStart = ndn.src; }
+            else if (ndn.k === 'delim' && ndn.len === ndn.origLen && ndn.src !== undefined) { runText = ndn.ch.repeat(ndn.len) + runText; runStart = ndn.src; }
+            else break;
+          }
+          const um = /(?:https?:\/\/|ftp:\/\/|www\.)[^\s]*$/.exec(runText);
+          if (um) {
+            const before = um.index > 0 ? runText[um.index - 1] : (runStart > 0 ? text[runStart - 1] : undefined);
+            if (isAutolinkBoundary(before)) { buf += ch; i++; continue; }
+          }
         }
         flush(); push({ k: 'hard' }); i += 2;
         while (text[i] === ' ' || text[i] === '\t') i++;
@@ -1884,6 +2177,11 @@ function parseInlineNodes(text, refs, ctx) {
       continue;
     }
     if (ch === '&') {
+      if (rawBlock) {
+        // Inside a raw block the text is verbatim: no reference decoding.
+        if (buf === '') bufStart = i;
+        buf += ch; i++; continue;
+      }
       // numeric character reference: decoded, then escaped on render
       if (text[i + 1] === '#') {
         const e = matchEntity(text, i);
@@ -1914,6 +2212,8 @@ function parseInlineNodes(text, refs, ctx) {
         flush(); push({ k: 'raw', s: html.text });
         if (/^<a /i.test(html.text)) inLink = true;
         else if (/^<\/a>$/i.test(html.text)) inLink = false;
+        if (!rawBlock && /^<(pre|code|kbd|script)[\s>]/i.test(html.text)) rawBlock = true;
+        else if (rawBlock && /^<\/(pre|code|kbd|script)[\s>]/i.test(html.text)) rawBlock = false;
         i += html.len; continue;
       }
       if (buf === '') bufStart = i;
@@ -1949,16 +2249,26 @@ function parseInlineNodes(text, refs, ctx) {
         }
       }
       if (formed && formed !== 'dead') {
-        flush();
         // While a link's or image's label is tokenised, marked's inLink
         // state is set: extended autolinks do not form inside it. The
         // state used for the label is discarded when the link is done.
-        const sub = parseInlineNodes(labelText, refs, { inLink: true });
-        const idx = adopt(sub, image ? 'image' : 'link');
-        nd[idx].href = formed.dest;
-        nd[idx].title = formed.title;
-        i = formed.end;
-        continue;
+        // The raw-block state, by contrast, flows into the label and an
+        // accepted link keeps whatever the label's tokenising left.
+        const subCtx = { inLink: true, rawBlock };
+        const sub = parseInlineNodes(labelText, refs, subCtx);
+        // Marked rejects a (non-image) link whose label's tokenising
+        // emitted a link of its own; the bracket then stays literal and
+        // scanning continues inside it. The raw-block state is also
+        // restored in that case.
+        if (image || !sub.nd.some(node => node.k === 'link')) {
+          flush();
+          rawBlock = subCtx.rawBlock;
+          const idx = adopt(sub, image ? 'image' : 'link');
+          nd[idx].href = formed.dest;
+          nd[idx].title = formed.title;
+          i = formed.end;
+          continue;
+        }
       }
       if (buf === '') bufStart = i;
       buf += image ? '![' : '[';
@@ -1969,10 +2279,10 @@ function parseInlineNodes(text, refs, ctx) {
       const att = emStrongAttempt(text, getMask().masked, getMask().lastClosers, i, i > 0 ? text[i - 1] : '');
       if (att) {
         flush();
-        if (ctx) ctx.inLink = inLink;
+        if (ctx) { ctx.inLink = inLink; ctx.rawBlock = rawBlock; }
         const sub = parseInlineNodes(att.inner, refs, ctx);
         adopt(sub, att.kind);
-        if (ctx) inLink = ctx.inLink;
+        if (ctx) { inLink = ctx.inLink; rawBlock = ctx.rawBlock; }
         i += att.rawLen;
         continue;
       }
@@ -1989,10 +2299,10 @@ function parseInlineNodes(text, refs, ctx) {
       const att = emStrongAttempt(text, getMask().masked, getMask().lastClosers, i, i > 0 ? text[i - 1] : '');
       if (att) {
         flush();
-        if (ctx) ctx.inLink = inLink;
+        if (ctx) { ctx.inLink = inLink; ctx.rawBlock = rawBlock; }
         const sub = parseInlineNodes(att.inner, refs, ctx);
         adopt(sub, 'del');
-        if (ctx) inLink = ctx.inLink;
+        if (ctx) { inLink = ctx.inLink; rawBlock = ctx.rawBlock; }
         i += att.rawLen;
         continue;
       }
@@ -2029,13 +2339,17 @@ function parseInlineNodes(text, refs, ctx) {
   let head = tail;
   if (head !== -1) { while (nd[head].prev !== -1) head = nd[head].prev; }
   extendAutolinks(nd, text, head);
-  if (ctx) ctx.inLink = inLink;
+  if (ctx) { ctx.inLink = inLink; ctx.rawBlock = rawBlock; }
   let last = head;
   if (last !== -1) { while (nd[last].next !== -1) last = nd[last].next; }
   return { nd, head, tail: last };
 }
 
 function parseInline(text, refs, ctx) {
+  // Each block's inline run starts with a fresh raw-block state (marked
+  // resets it for every queued inline run); the inLink leak, by contrast,
+  // is document-global and is left alone.
+  if (ctx) ctx.rawBlock = false;
   const { nd, head } = parseInlineNodes(text, refs, ctx);
   return renderRange(nd, head, -1);
 }
@@ -2354,7 +2668,7 @@ function renderRange(nd, first, last) {
 
 function renderNode(nd, node) {
   switch (node.k) {
-    case 'text': return escapeHtml(node.s);
+    case 'text': return node.raw ? node.s : escapeHtml(node.s);
     case 'raw': return node.s;
     case 'ch': return escapeHtml(node.s);
     case 'code': return '<code>' + escapeHtml(node.s) + '</code>';
