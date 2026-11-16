@@ -462,16 +462,21 @@ function parseBlocks(src) {
           } else {
             // The item ends here. The line still ends the item's slice on
             // the item's own terms when it opens a sibling item of the
-            // same list (checked from the state before the item's indent).
+            // same list (checked from the state before the item's indent)
+            // — but only for the innermost item, the one whose slice the
+            // HTML block actually sits in; a sibling of an outer item
+            // ends every enclosing slice at once.
             Object.assign(st, snap);
-            const ind = measureIndent(st);
-            if (ind.cols <= 3) {
-              const lm = matchListMarker(st.line, ind.pos, st.col + ind.cols, st.col);
-              if (lm) {
-                for (let q = si - 1; q >= 1; q--) {
-                  if (stackBelow[q].type === 'list') {
-                    if (sameListType(stackBelow[q].listData, lm)) sibling = true;
-                    break;
+            if (si === stackBelow.length - 1) {
+              const ind = measureIndent(st);
+              if (ind.cols <= 3) {
+                const lm = matchListMarker(st.line, ind.pos, st.col + ind.cols, st.col);
+                if (lm) {
+                  for (let q = si - 1; q >= 1; q--) {
+                    if (stackBelow[q].type === 'list') {
+                      if (sameListType(stackBelow[q].listData, lm)) sibling = true;
+                      break;
+                    }
                   }
                 }
               }
@@ -527,22 +532,22 @@ function parseBlocks(src) {
     return remainderText(st);
   }
 
-  /** Whether marked's list-item gathering would still include source line
-   *  li in every list item enclosing the fenced code block at the stack
-   *  tip, given that phase 1 matched containers only up to lastMatched.
-   *  Mirrors the gathering loop of marked's list tokenizer per item:
-   *  begin-breaks on the line, indent inclusion, and the lazy branch
-   *  (rejected when the previous gathered line was blank, is indented
-   *  code, or itself begins a fence / heading / HTML block / hr). A failed
-   *  block quote anywhere above the fence ends it (its text is gathered
-   *  from '>'-marked lines only). */
-  function fenceGatherOk(li, lastMatched, restNow) {
-    const top = stack.length - 1;
-    for (let si = lastMatched + 1; si < top; si++) if (stack[si].type === 'blockquote') return false;
-    let prevText = levelRest(lines[li - 1], lastMatched);
-    if (prevText === null) return false;
+  /** The deepest list item (stack index) that marked's gathering would
+   *  still include source line li in, testing items outermost-first from
+   *  baseIdx and threading the line's form inward (dedent on indent
+   *  inclusion, verbatim on lazy inclusion); baseIdx itself when no item
+   *  above it rejects the line (or none is tested), and -1 when the
+   *  previous line does not even reach baseIdx's frame. Mirrors the
+   *  gathering loop of marked's list tokenizer per item: begin-breaks on
+   *  the line, indent inclusion, and the lazy branch (rejected when the
+   *  previous gathered line was blank, is indented code, or itself
+   *  begins a fence / heading / HTML block / hr). */
+  function gatherDepth(li, baseIdx, restNow) {
+    let prevText = li > 0 ? levelRest(lines[li - 1], baseIdx) : null;
+    if (prevText === null) return -1;
     let curText = restNow;
-    for (let si = lastMatched + 1; si < top; si++) {
+    let deepest = baseIdx;
+    for (let si = baseIdx + 1; si < stack.length; si++) {
       const b = stack[si];
       if (b.type !== 'item') continue; // lists are transparent
       const R = b.indent;
@@ -557,19 +562,33 @@ function parseBlocks(src) {
         const zp = expandLeadTab(prevText, 0);
         prevForm = (prevBlank || zp.search(/[^ ]/) >= R) ? zp.slice(R) : prevText;
       }
-      if (beginBreakTest(curText, n, false)) return false;
+      if (beginBreakTest(curText, n, false)) return deepest;
       const z = expandLeadTab(curText, 0);
       if (z.search(/[^ ]/) >= R || isBlankText(curText)) {
         curText = z.slice(R);
       } else {
-        if (prevBlank) return false;
-        if (prevForm.replace(/\t/g, '    ').search(/[^ ]/) >= 4) return false;
-        if (beginBreakTest(prevForm, n, true)) return false;
+        if (prevBlank) return deepest;
+        if (prevForm.replace(/\t/g, '    ').search(/[^ ]/) >= 4) return deepest;
+        if (beginBreakTest(prevForm, n, true)) return deepest;
         // Lazy inclusion: the line enters the item text verbatim.
       }
       prevText = prevForm;
+      deepest = si;
     }
-    return true;
+    return deepest;
+  }
+
+  /** Whether marked's list-item gathering would still include source line
+   *  li in every list item enclosing the fenced code block at the stack
+   *  tip, given that phase 1 matched containers only up to lastMatched.
+   *  A failed block quote anywhere above the fence ends it (its text is
+   *  gathered from '>'-marked lines only). */
+  function fenceGatherOk(li, lastMatched, restNow) {
+    const top = stack.length - 1;
+    for (let si = lastMatched + 1; si < top; si++) if (stack[si].type === 'blockquote') return false;
+    let deepestItem = lastMatched;
+    for (let si = lastMatched + 1; si < top; si++) if (stack[si].type === 'item') deepestItem = si;
+    return gatherDepth(li, lastMatched, restNow) === deepestItem;
   }
 
   for (let li = 0; li < lines.length; li++) {
@@ -606,7 +625,23 @@ function parseBlocks(src) {
         advanceIndent(st, b.indent);
         advanceIndent(stL, b.indent);
         if (st.col - beforeCol >= b.indent || isBlankText(remainderText(st))) { lastMatched = si; levelBlank[si] = isBlankText(remainderText(st)); }
-        else { allMatched = false; Object.assign(st, snap); break; }
+        else {
+          allMatched = false; Object.assign(st, snap);
+          // Marked gathers item text line by line before lexing it, so a
+          // line that fails this (deepest) item's indent can still be
+          // gathered lazily into the item. When the stack tip is a fenced
+          // code block, the fence's own continuation test then ends the
+          // fence (a failed quote above it), but the item survives and
+          // the line becomes item content instead of closing the list.
+          const tipB = tip();
+          if (tipB.type === 'code' && tipB.fenced && !isBlankText(remainderText(st)) &&
+              !stack.slice(si + 1).some((x) => x.type === 'item') &&
+              gatherDepth(li, si - 1, remainderText(st)) === si) {
+            lastMatched = si;
+            levelBlank[si] = false;
+          }
+          break;
+        }
       } else if (b.type === 'list') {
         lastMatched = si;
         levelBlank[si] = isBlankText(remainderText(st));
@@ -632,8 +667,16 @@ function parseBlocks(src) {
         li--;
         continue;
       }
+      // The quote's text ended at the stashed line: it joins the
+      // paragraph, and the paragraph and the unmatched containers
+      // close before this line — no lazy continuation can follow a
+      // whitespace-only line in a block quote.
       cur.lines.push(cur.wsStash);
       cur.wsStash = undefined;
+      finalize(stack.pop());
+      closeBlocks(lastMatched);
+      li--;
+      continue;
     }
 
     // Deferred code-tail handling: a paragraph in a list item whose last
@@ -742,7 +785,11 @@ function parseBlocks(src) {
           finalize(stack.pop());
           continue; // the blank line itself is consumed
         }
-        cur.lines.push(restNow);
+        // Inside a container, marked's assembly of the container text
+        // expands tabs in a line's leading whitespace run to the next
+        // multiple-of-4 column (counted from the original line start);
+        // at the top level the line stays raw.
+        cur.lines.push(cur.parent && cur.parent.type !== 'document' ? leadExpand(restNow, st) : restNow);
         if (htmlBlockEnd(cur.cond, restNow)) {
           cur.eofEnd = computeHtmlEofEnd(stack.slice(0, -1), li);
           finalize(stack.pop());
@@ -963,7 +1010,7 @@ function parseBlocks(src) {
           ensureClosed();
           if (tip().type === 'paragraph') finalize(stack.pop());
           const hb = addChild(tip(), newBlock('html'));
-          hb.cond = cond; hb.lines = [remainderText(st)];
+          hb.cond = cond; hb.lines = [tip().type === 'document' ? remainderText(st) : leadExpand(remainderText(st), st)];
           if (htmlBlockEnd(cond, hb.lines[0]) && cond < 6) {
             hb.open = false;
             hb.eofEnd = computeHtmlEofEnd(stack, li);
@@ -1076,6 +1123,27 @@ function parseBlocks(src) {
       if (inItemPara) {
         let txt = remainderText(st);
         if (stack.length > 2) txt = leadExpand(txt, st);
+        if (!allMatched) {
+          // A lazy line that begins a new block (marked's item-gathering
+          // begin tests) is not gathered into the item's text at all:
+          // close the unmatched containers and let the line be
+          // reprocessed at the level it did match.
+          let itemB = null;
+          for (let b = cur.parent; b; b = b.parent) {
+            if (b.type === 'list') continue;
+            if (b.type === 'item') itemB = b;
+            break;
+          }
+          if (itemB) {
+            const n = Math.max(0, Math.min(3, itemB.indent - 1));
+            if (beginBreakTest(txt, n, false)) {
+              closeBlocks(lastMatched);
+              while (tip().type === 'list') finalize(stack.pop());
+              li--;
+              continue;
+            }
+          }
+        }
         if (txt.startsWith('    ')) txt = txt.slice(4);
         if (!allMatched && cur.lines.length >= 2 && /^ {0,3}(=+|-+)[ \t]*$/.test(txt)) {
           let hasQuote = false;
@@ -1321,6 +1389,10 @@ function collectRefs(root, refs) {
       if (ch[idx].wantMerge && ch[idx + 1].type === 'paragraph') {
         ch[idx].lines = ch[idx].lines.concat(ch[idx + 1].lines);
         ch.splice(idx + 1, 1);
+        // The underline-turned-text merges with the one following
+        // paragraph; the flag must not let it swallow every later
+        // paragraph as well.
+        ch[idx].wantMerge = false;
         idx--;
       }
     }
@@ -1653,12 +1725,20 @@ function matchLabelTag(text, i) {
 
 // Find the ']' that ends a link label starting at `from`, following
 // marked's label grammar (see labelOk): returns its index or -1.
-function findLabelEnd(text, from) {
+function findLabelEnd(text, from, blind) {
   const n = text.length;
   let i = from;
   while (i < n) {
     const c = text[i];
-    if (c === '\\') { i += 2; continue; }
+    if (c === '\\') {
+      // In the blind scan used by the contains-link check, an escaped
+      // ']' still ends the label: marked's detection of a link inside a
+      // label does not honour the backslash before a closing bracket,
+      // so a nested label containing '\]' reads as ending there and
+      // whatever follows is not seen as that bracket's destination.
+      if (blind && text[i + 1] === ']') return i + 1;
+      i += 2; continue;
+    }
     if (c === '[') {
       const end = scanLabelGroup(text, i);
       if (end === -1) return -1;
@@ -1698,7 +1778,7 @@ function linkInText(s, refs) {
     if (c === '\\') { p += 2; continue; }
     if (c !== '[') { p++; continue; }
     const image = p > 0 && s[p - 1] === '!' && (p < 2 || s[p - 2] !== '\\');
-    const le = findLabelEnd(s, p + 1);
+    const le = findLabelEnd(s, p + 1, true);
     if (le === -1) { p++; continue; }
     const labelText = s.slice(p + 1, le);
     if (image) {
@@ -1723,6 +1803,46 @@ function linkInText(s, refs) {
     p++;
   }
   return false;
+}
+
+/** Classify the bracket links a label scan (the same traversal as
+ *  linkInText) resolves: whether any is a collapsed reference link
+ *  ([x][]) and whether any has another form (inline, full reference, or
+ *  shortcut). Autolinks and image constructs do not count. */
+function labelLinkForms(s, refs) {
+  let collapsed = false; let other = false;
+  const n = s.length;
+  let p = 0;
+  while (p < n) {
+    const c = s[p];
+    if (c === '\\') { p += 2; continue; }
+    if (c !== '[') { p++; continue; }
+    const image = p > 0 && s[p - 1] === '!' && (p < 2 || s[p - 2] !== '\\');
+    const le = findLabelEnd(s, p + 1, true);
+    if (le === -1) { p++; continue; }
+    const labelText = s.slice(p + 1, le);
+    if (image) {
+      let end = le + 1;
+      if (s[end] === '(') { const pl = parseInlineLink(s, end); if (pl) end = pl.end; }
+      else if (s[end] === '[') { const rl = parseRefLabel(s, end); if (rl) end = rl.end; }
+      p = end; continue;
+    }
+    if (s[le + 1] === '(' && parseInlineLink(s, le + 1)) { other = true; p = le + 1; continue; }
+    if (s[le + 1] === '[') {
+      const rl = parseRefLabel(s, le + 1);
+      if (rl) {
+        const lab = rl.label === '' ? labelText : rl.label;
+        if (refs.has(normalizeLabel(lab))) {
+          if (rl.label === '') collapsed = true; else other = true;
+          p = rl.end; continue;
+        }
+        p++; continue;
+      }
+    }
+    if (refs.has(normalizeLabel(labelText))) { other = true; p = le + 1; continue; }
+    p++;
+  }
+  return { collapsed, other };
 }
 
 // Match the loose label content of a shortcut/reference bracket (escapes
@@ -2042,6 +2162,17 @@ function parseInlineNodes(text, refs, ctx) {
   // no escaping) until the matching end tag. It resets for every block's
   // inline run, but is shared with nested runs (emphasis, link labels).
   let rawBlock = ctx ? !!ctx.rawBlock : false;
+  // While a link or image label is being tokenised, marked's inLink
+  // state disables the link rule itself: brackets inside a label never
+  // form links (images still do), whatever they would form outside.
+  const inLabel = ctx ? !!ctx.inLabel : false;
+  // Spans of `text` in which emphasis/delimiter matching is suppressed:
+  // the label of a full reference link that was rejected for containing
+  // a link, when every bracket link in the label is a collapsed
+  // reference link — marked leaves those labels' delimiters literal
+  // when it falls back to scanning the label as ordinary text.
+  const emSuppress = [];
+  const emSuppressed = (pos, rawLen) => emSuppress.some(([s, e]) => pos >= s && pos + rawLen <= e);
   function push(node) {
     node.prev = tail; node.next = -1; node.parent = -1; node.gone = false;
     nd.push(node);
@@ -2227,7 +2358,20 @@ function parseInlineNodes(text, refs, ctx) {
       const le = findLabelEnd(text, labelStart);
       let formed = null;
       const labelText = le !== -1 ? text.slice(labelStart, le) : '';
-      if (le !== -1) {
+      // When a full reference link is rejected because its label
+      // contains a link, and every bracket link in the label is a
+      // collapsed reference link, marked's fallback scan of the label
+      // leaves its emphasis delimiters literal: record the span.
+      const registerEmSuppress = () => {
+        if (text[le + 1] !== '[') return;
+        const rl = parseRefLabel(text, le + 1);
+        if (!rl) return;
+        const lab = rl.label === '' ? labelText : rl.label;
+        if (!refs.has(normalizeLabel(lab))) return;
+        const forms = labelLinkForms(labelText, refs);
+        if (forms.collapsed && !forms.other) emSuppress.push([labelStart, le]);
+      };
+      if (le !== -1 && (image || !inLabel)) {
         if (image || !linkInText(labelText, refs)) {
           if (text[le + 1] === '(') {
             const p = parseInlineLink(text, le + 1);
@@ -2246,6 +2390,8 @@ function parseInlineNodes(text, refs, ctx) {
             const def = refs.get(normalizeLabel(labelText));
             if (def) formed = { dest: def.dest, title: def.title, end: le + 1 };
           }
+        } else {
+          registerEmSuppress();
         }
       }
       if (formed && formed !== 'dead') {
@@ -2254,13 +2400,22 @@ function parseInlineNodes(text, refs, ctx) {
         // state used for the label is discarded when the link is done.
         // The raw-block state, by contrast, flows into the label and an
         // accepted link keeps whatever the label's tokenising left.
-        const subCtx = { inLink: true, rawBlock };
+        const subCtx = { inLink: true, rawBlock, inLabel: !image };
         const sub = parseInlineNodes(labelText, refs, subCtx);
         // Marked rejects a (non-image) link whose label's tokenising
         // emitted a link of its own; the bracket then stays literal and
         // scanning continues inside it. The raw-block state is also
-        // restored in that case.
-        if (image || !sub.nd.some(node => node.k === 'link')) {
+        // restored in that case. A link emitted inside an image within
+        // the label does not count: the image is a sealed unit whose
+        // label is tokenised with the link rule live.
+        const emitsLink = sub.nd.some((node, ni) => {
+          if (node.k !== 'link') return false;
+          for (let p = node.parent; p !== -1; p = sub.nd[p].parent) {
+            if (sub.nd[p].k === 'image') return false;
+          }
+          return true;
+        });
+        if (image || !emitsLink) {
           flush();
           rawBlock = subCtx.rawBlock;
           const idx = adopt(sub, image ? 'image' : 'link');
@@ -2269,6 +2424,7 @@ function parseInlineNodes(text, refs, ctx) {
           i = formed.end;
           continue;
         }
+        if (!image) registerEmSuppress();
       }
       if (buf === '') bufStart = i;
       buf += image ? '![' : '[';
@@ -2277,7 +2433,7 @@ function parseInlineNodes(text, refs, ctx) {
     }
     if (ch === '*' || ch === '_') {
       const att = emStrongAttempt(text, getMask().masked, getMask().lastClosers, i, i > 0 ? text[i - 1] : '');
-      if (att) {
+      if (att && !emSuppressed(i, att.rawLen)) {
         flush();
         if (ctx) { ctx.inLink = inLink; ctx.rawBlock = rawBlock; }
         const sub = parseInlineNodes(att.inner, refs, ctx);
@@ -2297,7 +2453,7 @@ function parseInlineNodes(text, refs, ctx) {
         buf += text.slice(i, j); i = j; continue;
       }
       const att = emStrongAttempt(text, getMask().masked, getMask().lastClosers, i, i > 0 ? text[i - 1] : '');
-      if (att) {
+      if (att && !emSuppressed(i, att.rawLen)) {
         flush();
         if (ctx) { ctx.inLink = inLink; ctx.rawBlock = rawBlock; }
         const sub = parseInlineNodes(att.inner, refs, ctx);
@@ -2487,7 +2643,7 @@ function trimAutolink(s) {
   return s.slice(0, i);
 }
 
-const RE_EMAIL_EXT = /^([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+)/;
+const RE_EMAIL_EXT = /^([\w.+-]+)@((?:[\w-]+\.)+[\w-]*[A-Za-z0-9])(?![\w-])/;
 
 /** Split a text node's string into plain and autolink segments. */
 function splitAutolinks(s, srcBefore) {
@@ -2496,49 +2652,52 @@ function splitAutolinks(s, srcBefore) {
   let i = 0;
   const prevAt = (pos) => (pos > 0 ? s[pos - 1] : srcBefore);
   while (i < s.length) {
-    if (isAutolinkBoundary(prevAt(i))) {
-      let kind = null; let schemeLen = 0;
-      if (s.startsWith('www.', i)) kind = 'www';
-      else {
-        const head = s.slice(i, i + 8).toLowerCase();
-        if (head.startsWith('https://')) { kind = 'url'; schemeLen = 8; }
-        else if (head.startsWith('http://')) { kind = 'url'; schemeLen = 7; }
-        else if (head.startsWith('ftp://')) { kind = 'url'; schemeLen = 6; }
+    const boundary = isAutolinkBoundary(prevAt(i));
+    let kind = null; let schemeLen = 0;
+    // Marked's url tokeniser fires on a scheme at any position, even
+    // mid-word; the www. form needs a boundary before it.
+    const head = s.slice(i, i + 8).toLowerCase();
+    if (head.startsWith('https://')) { kind = 'url'; schemeLen = 8; }
+    else if (head.startsWith('http://')) { kind = 'url'; schemeLen = 7; }
+    else if (head.startsWith('ftp://')) { kind = 'url'; schemeLen = 6; }
+    else if (boundary && s.startsWith('www.', i)) kind = 'www';
+    if (kind) {
+      let j = i;
+      while (j < s.length && !isWsCh(s[j]) && s[j] !== '<') j++;
+      const raw = s.slice(i, j);
+      const trimmed = trimAutolink(raw);
+      // After the scheme or www. prefix, marked's pattern needs a
+      // domain label character; the rest of the candidate is free-form.
+      const rest = kind === 'url' ? trimmed.slice(schemeLen) : trimmed.slice(4);
+      if (rest && /[A-Za-z0-9_-]/.test(rest[0])) {
+        if (plain) { segs.push({ t: 'text', s: plain }); plain = ''; }
+        segs.push({ t: 'auto', s: trimmed, href: kind === 'www' ? 'http://' + trimmed : trimmed });
+        i += trimmed.length;
+        continue;
       }
-      if (kind) {
-        let j = i;
-        while (j < s.length && !isWsCh(s[j]) && s[j] !== '<') j++;
-        const raw = s.slice(i, j);
-        const trimmed = trimAutolink(raw);
-        // After the scheme or www. prefix, marked's pattern needs a
-        // domain label character; the rest of the candidate is free-form.
-        const rest = kind === 'url' ? trimmed.slice(schemeLen) : trimmed.slice(4);
-        if (rest && /[A-Za-z0-9_-]/.test(rest[0])) {
-          if (plain) { segs.push({ t: 'text', s: plain }); plain = ''; }
-          segs.push({ t: 'auto', s: trimmed, href: kind === 'www' ? 'http://' + trimmed : trimmed });
-          i += trimmed.length;
-          continue;
-        }
-      } else {
-        // Email, optionally prefixed by mailto: or xmpp: (the prefix is
-        // part of the link; xmpp allows one /resource segment after it).
-        let prefix = '';
+    } else {
+      // Email, attempted at any position: marked's local part is word
+      // characters plus '.', '+' and '-', its domain dot-joined word or
+      // hyphen segments. A mailto: or xmpp: prefix is part of the link
+      // only at a boundary (xmpp allows one /resource segment after).
+      let prefix = '';
+      if (boundary) {
         if (s.startsWith('mailto:', i)) prefix = 'mailto:';
         else if (s.startsWith('xmpp:', i)) prefix = 'xmpp:';
-        const em = RE_EMAIL_EXT.exec(s.slice(i + prefix.length));
-        if (em && validDomain(em[2], false)) {
-          let total = prefix + em[0];
-          if (prefix === 'xmpp:' && s[i + total.length] === '/') {
-            const res = /^[A-Za-z0-9@.]+/.exec(s.slice(i + total.length + 1));
-            if (res && res[0].length) total += '/' + res[0];
-          }
-          const after = s[i + total.length];
-          if (!(after !== undefined && /[A-Za-z0-9_]/.test(after))) {
-            if (plain) { segs.push({ t: 'text', s: plain }); plain = ''; }
-            segs.push({ t: 'auto', s: total, href: prefix ? total : 'mailto:' + total });
-            i += total.length;
-            continue;
-          }
+      }
+      const em = RE_EMAIL_EXT.exec(s.slice(i + prefix.length));
+      if (em) {
+        let total = prefix + em[0];
+        if (prefix === 'xmpp:' && s[i + total.length] === '/') {
+          const res = /^[A-Za-z0-9@.]+/.exec(s.slice(i + total.length + 1));
+          if (res && res[0].length) total += '/' + res[0];
+        }
+        const after = s[i + total.length];
+        if (!(after !== undefined && /[\w-]/.test(after))) {
+          if (plain) { segs.push({ t: 'text', s: plain }); plain = ''; }
+          segs.push({ t: 'auto', s: total, href: prefix ? total : 'mailto:' + total });
+          i += total.length;
+          continue;
         }
       }
     }
@@ -2558,9 +2717,9 @@ function extendAutolinks(nd, srcText, head) {
   const srcLen = (node) => node.srcLen !== undefined ? node.srcLen : node.s.length;
   const mergeable = (node, inLink) => !inLink && !node.gone && !node.esc && !node.il &&
     (node.k === 'text' || (node.k === 'delim' && node.len === node.origLen));
-  const walk = (first, last, inLink) => {
+  const walk = (first, last, inLink, top) => {
     let run = [];
-    const flushRun = () => { if (run.length) { runs.push(run); run = []; } };
+    const flushRun = () => { if (run.length) { runs.push({ nodes: run, top }); run = []; } };
     for (let c = first; c !== -1;) {
       const node = nd[c];
       const nx = node.next;
@@ -2573,7 +2732,7 @@ function extendAutolinks(nd, srcText, head) {
       } else {
         flushRun();
         if ((node.k === 'em' || node.k === 'strong' || node.k === 'del' || node.k === 'link' || node.k === 'image') && node.childFirst !== -1 && !node.sealed) {
-          walk(node.childFirst, node.childLast, inLink || node.k === 'link');
+          walk(node.childFirst, node.childLast, inLink || node.k === 'link', false);
         }
       }
       if (c === last) break;
@@ -2581,11 +2740,63 @@ function extendAutolinks(nd, srcText, head) {
     }
     flushRun();
   };
-  walk(head, -2, false);
+  walk(head, -2, false, true);
+  // The source text of the sibling node that follows a run, when an
+  // extended-autolink candidate may run on into it: marked's url
+  // tokeniser scans the raw source, blind to the link, image or code
+  // constructs the scanner has already made of that source, so the
+  // candidate is the maximal non-space run across those constructs and
+  // is trimmed only once, at its very end. Returns null when the
+  // sibling's source cannot be recovered in this text frame.
+  const ghostText = (node, endOff) => {
+    if (node.k === 'text') {
+      if (node.esc || node.raw || node.s === '' || /\s/.test(node.s[0])) return null;
+      return node.s;
+    }
+    if (node.k === 'delim') {
+      if (node.len !== node.origLen) return null;
+      return node.ch.repeat(node.len);
+    }
+    if (node.k === 'link' || node.k === 'image') {
+      const image = node.k === 'image';
+      if (srcText[endOff] !== (image ? '!' : '[')) return null;
+      if (image && srcText[endOff + 1] !== '[') return null;
+      const le = findLabelEnd(srcText, endOff + (image ? 2 : 1));
+      if (le === -1) return null;
+      let end;
+      if (srcText[le + 1] === '(') {
+        const p = parseInlineLink(srcText, le + 1);
+        if (!p) return null;
+        end = p.end;
+      } else if (srcText[le + 1] === '[') {
+        const rl = parseRefLabel(srcText, le + 1);
+        if (!rl) return null;
+        end = rl.end;
+      } else end = le + 1;
+      return srcText.slice(endOff, end);
+    }
+    if (node.k === 'code') {
+      if (srcText[endOff] !== '`') return null;
+      let j = endOff;
+      while (j < srcText.length && srcText[j] === '`') j++;
+      const runLen = j - endOff;
+      for (let k = j; k < srcText.length;) {
+        if (srcText[k] === '`') {
+          let e = k;
+          while (e < srcText.length && srcText[e] === '`') e++;
+          if (e - k === runLen) return srcText.slice(endOff, e);
+          k = e;
+        } else k++;
+      }
+      return null;
+    }
+    return null;
+  };
   for (const run of runs) {
-    const firstNode = nd[run[0]];
+    const firstNode = nd[run.nodes[0]];
     if (firstNode.gone) continue;
-    const combined = run.map((ix) => {
+    let nodes = run.nodes;
+    let combined = nodes.map((ix) => {
       const ndn = nd[ix];
       return ndn.k === 'text' ? ndn.s : ndn.ch.repeat(ndn.len);
     }).join('');
@@ -2593,11 +2804,40 @@ function extendAutolinks(nd, srcText, head) {
     // Fast reject: without any autolink-shaped substring the run cannot
     // produce a link, so the detailed scan is skipped entirely.
     if (!/www\.|https?:|ftp:|mailto:|xmpp:|@/i.test(combined)) continue;
-    const segs = splitAutolinks(combined, srcBefore);
+    let segs = splitAutolinks(combined, srcBefore);
+    if (run.top) {
+      // Absorb following siblings into the candidate while the run's
+      // last autolink reaches the end of the text scanned so far (the
+      // tail after it holding no whitespace or '<'), then re-split.
+      let endOff = -1;
+      for (;;) {
+        let autoEnd = -1; let pos = 0;
+        for (const sg of segs) {
+          if (sg.t === 'auto') autoEnd = pos + sg.s.length;
+          pos += sg.s.length;
+        }
+        if (autoEnd === -1) break;
+        if (/[\s<]/.test(combined.slice(autoEnd))) break;
+        const lastIdx = nodes[nodes.length - 1];
+        const sib = nd[lastIdx].next;
+        if (sib === -1 || nd[sib].gone) break;
+        if (endOff === -1) {
+          const ln = nd[lastIdx];
+          if (ln.src === undefined) break;
+          endOff = ln.src + srcLen(ln);
+        }
+        const ghost = ghostText(nd[sib], endOff);
+        if (ghost === null || ghost === '') break;
+        nodes = [...nodes, sib];
+        combined += ghost;
+        endOff += ghost.length;
+        segs = splitAutolinks(combined, srcBefore);
+      }
+    }
     if (segs.length === 1 && segs[0].t === 'text') continue;
-    const lastNode = nd[run[run.length - 1]];
+    const lastNode = nd[nodes[nodes.length - 1]];
     const parent = firstNode.parent;
-    const isFirstChild = parent !== -1 && nd[parent].childFirst === run[0];
+    const isFirstChild = parent !== -1 && nd[parent].childFirst === nodes[0];
     let prevIdx = firstNode.prev;
     let firstNew = -1;
     for (const seg of segs) {
@@ -2612,12 +2852,12 @@ function extendAutolinks(nd, srcText, head) {
     }
     nd[prevIdx].next = lastNode.next;
     if (lastNode.next !== -1) nd[lastNode.next].prev = prevIdx;
-    for (const ix of run) nd[ix].gone = true;
+    for (const ix of nodes) nd[ix].gone = true;
     firstNode.next = firstNew; // keep head-of-chain traversal working when prev was -1
     if (firstNode.parent !== -1) {
       const p = nd[firstNode.parent];
-      if (p.childFirst === run[0]) p.childFirst = firstNew;
-      if (p.childLast === run[run.length - 1]) p.childLast = prevIdx;
+      if (p.childFirst === nodes[0]) p.childFirst = firstNew;
+      if (p.childLast === nodes[nodes.length - 1]) p.childLast = prevIdx;
     }
   }
 }
