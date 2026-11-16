@@ -18,7 +18,7 @@ const C1_MAP = [0x20AC, 0x81, 0x201A, 0x192, 0x201E, 0x2026, 0x2020, 0x2021, 0x2
 
 /** Decode a numeric character reference value the way HTML requires. */
 function decodeNumericEntity(cp) {
-  if (!Number.isFinite(cp) || cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return '�';
+  if (!Number.isFinite(cp) || cp === 0 || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return '\uFFFD';
   return String.fromCodePoint(cp);
 }
 
@@ -66,7 +66,7 @@ function isPunctCh(ch) {
   return UNICODE_PUNCT_RE.test(ch);
 }
 function isWsCh(ch) {
-  return ch === undefined || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v' || ch === ' ' || ch === ' ' || (ch >= ' ' && ch <= ' ') || ch === ' ' || ch === ' ' || ch === ' ' || ch === ' ' || ch === '　' || ch === '﻿';
+  return ch === undefined || ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v' || ch === '\u00A0' || ch === '\u1680' || (ch >= '\u2000' && ch <= '\u200A') || ch === '\u2028' || ch === '\u2029' || ch === '\u202F' || ch === '\u205F' || ch === '\u3000' || ch === '\uFEFF';
 }
 
 // ------------------------------------------------------------- block parsing
@@ -173,7 +173,23 @@ function expandLeadTab(text, startCol) {
   return out + text.slice(i);
 }
 
-function isBlankText(s) { return /^[ \t]*$/.test(s); }
+function isBlankText(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c !== ' ' && c !== '\t') return false;
+  }
+  return true;
+}
+
+/** Marked post-processes every block-HTML match by dropping trailing blank
+ *  lines: if more than one line follows the last non-blank line, the match
+ *  is cut back to that line (and loses any trailing newline with them). */
+function geTrim(a) {
+  const e = a.split('\n');
+  let t = e.length - 1;
+  while (t >= 0 && isBlankText(e[t])) t--;
+  return e.length - t <= 2 ? a : e.slice(0, t + 1).join('\n');
+}
 
 const RE_ATX = /^(#{1,6})(?:[ \t]+(.*)|[ \t]*$)/;
 const RE_ATX_CLOSE = /[ \t]+#+[ \t]*$/;
@@ -362,6 +378,80 @@ function parseBlocks(src) {
     while (stack.length - 1 > uptoIdx) finalize(stack.pop());
   }
 
+  /** Decide whether an HTML block whose last line is source line li renders
+   *  with a trailing newline. Marked lexes each container's text slice
+   *  separately (lines joined with '\n'; a last list item's slice is also
+   *  trimmed of trailing whitespace) and its HTML match keeps the block's
+   *  final newline exactly when a single newline follows the block inside
+   *  that slice: more slice content on the very next line, a sibling list
+   *  item after exactly one blank line, or a slice that ends one newline
+   *  after the block. Blank lines inside the slice are swallowed by the
+   *  match and stripped again, so they always remove the newline.
+   *  stackBelow is the block's parent chain (the block itself excluded). */
+  function computeHtmlEofEnd(stackBelow, li) {
+    const innermost = stackBelow[stackBelow.length - 1];
+    let blanks = 0;
+    for (let j = li + 1; j < lines.length; j++) {
+      const st = makeState(lines[j]);
+      let matched = true;
+      let sibling = false;
+      for (let si = 1; si < stackBelow.length; si++) {
+        const b = stackBelow[si];
+        if (b.type === 'blockquote') {
+          const colBefore = st.col;
+          advanceIndent(st, 3);
+          if (st.partialTab === 0 && st.line[st.pos] === '>') {
+            const leadCols = st.col - colBefore;
+            st.pos++; st.col++;
+            quoteSepExpand(st, leadCols);
+          } else { matched = false; break; }
+        } else if (b.type === 'item') {
+          if (b.deadEmpty) { matched = false; break; }
+          const snap = { line: st.line, pos: st.pos, col: st.col, partialTab: st.partialTab };
+          const beforeCol = st.col;
+          advanceIndent(st, b.indent);
+          if (st.col - beforeCol >= b.indent || isBlankText(remainderText(st))) {
+            // The line belongs to the item: slice content or a blank.
+          } else {
+            // The item ends here. The line still ends the item's slice on
+            // the item's own terms when it opens a sibling item of the
+            // same list (checked from the state before the item's indent).
+            Object.assign(st, snap);
+            const ind = measureIndent(st);
+            if (ind.cols <= 3) {
+              const lm = matchListMarker(st.line, ind.pos, st.col + ind.cols, st.col);
+              if (lm) {
+                for (let q = si - 1; q >= 1; q--) {
+                  if (stackBelow[q].type === 'list') {
+                    if (sameListType(stackBelow[q].listData, lm)) sibling = true;
+                    break;
+                  }
+                }
+              }
+            }
+            matched = false; break;
+          }
+        }
+        // 'list' containers are transparent to the line scan.
+      }
+      if (sibling) return blanks === 1;
+      if (!matched) {
+        if (innermost.type === 'blockquote') return blanks === 1;
+        return false; // a last list item's slice is trimmed; document never fails
+      }
+      const rem = remainderText(st);
+      if (rem === '') { blanks++; continue; }
+      // A whitespace-only or content line ends the match's newline run:
+      // the block keeps its newline exactly when no pure blank line
+      // intervened (the run is the line's own terminator plus blanks).
+      return blanks === 0;
+    }
+    // Ran out of lines: the slice ends with the document / container.
+    if (innermost.type === 'item') return false;
+    if (innermost.type === 'blockquote') return blanks === 1;
+    return blanks + (srcEndsNl ? 1 : 0) === 1;
+  }
+
   for (let li = 0; li < lines.length; li++) {
     const rawLine = lines[li];
     const st = makeState(rawLine);
@@ -418,7 +508,8 @@ function parseBlocks(src) {
       // marked's item gathering otherwise ends the item at that line,
       // leaving the fence unclosed inside the item.
       const fenceRunsOn = cur.type === 'code' && cur.fenced && cur.established &&
-        stack[lastMatched + 1] && stack[lastMatched + 1].type === 'item';
+        stack[lastMatched + 1] && stack[lastMatched + 1].type === 'item' &&
+        !stack.slice(lastMatched + 1, -1).some((b) => b.type === 'blockquote');
       if (!allMatched && !fenceRunsOn) {
         closeBlocks(lastMatched);
         cur = tip();
@@ -476,7 +567,7 @@ function parseBlocks(src) {
         }
         cur.lines.push(restNow);
         if (htmlBlockEnd(cur.cond, restNow)) {
-          cur.eofEnd = li + 1 < lines.length ? lines[li + 1] !== '' : srcEndsNl;
+          cur.eofEnd = computeHtmlEofEnd(stack.slice(0, -1), li);
           finalize(stack.pop());
         }
         continue;
@@ -651,7 +742,7 @@ function parseBlocks(src) {
           hb.cond = cond; hb.lines = [remainderText(st)];
           if (htmlBlockEnd(cond, hb.lines[0]) && cond < 6) {
             hb.open = false;
-            hb.eofEnd = li + 1 < lines.length ? lines[li + 1] !== '' : srcEndsNl;
+            hb.eofEnd = computeHtmlEofEnd(stack, li);
           }
           else stack.push(hb);
           consumedLine = true;
@@ -811,7 +902,9 @@ function parseBlocks(src) {
   }
 
   // End of input: any HTML block still open runs to the end of the source.
-  for (const b of stack) if (b.type === 'html') b.eofEnd = srcEndsNl;
+  // Only a top-level block's text keeps the source's final newline; inside
+  // a container the slice ends with the block's last line itself.
+  for (const b of stack) if (b.type === 'html') b.eofEnd = b.parent && b.parent.type === 'document' ? srcEndsNl : false;
   closeBlocks(0);
   return root;
 }
@@ -972,7 +1065,7 @@ function collectRefs(root, refs) {
 
 function normalizeLabel(raw) {
   return raw.replace(/\s+/g, ' ').trim().toLowerCase()
-    .replace(/ß/g, 'ss').replace(/ſ/g, 's').replace(/ς/g, 'σ');
+    .replace(/\u00DF/g, 'ss').replace(/\u017F/g, 's').replace(/\u03C2/g, '\u03C3');
 }
 
 const TAG_NAME = '[A-Za-z][A-Za-z0-9-]*';
@@ -1629,7 +1722,7 @@ function emStrongAttempt(text, masked, lastClosers, pos, prevCharIn) {
   while (true) {
     if (first) {
       first = false;
-      if (r !== '~') {
+      if (r !== '~' && masked.indexOf(r === '*' ? '__' : '**', Q) !== -1) {
         const sp = EM_SPECIAL[r].exec(masked.slice(Q));
         if (sp) { scanPos = Q + sp[0].length; }
       }
@@ -1684,8 +1777,15 @@ function parseInlineNodes(text, refs, ctx) {
   let maskCache = null;
   const getMask = () => {
     if (!maskCache) {
-      const m = maskText(text, refs);
-      maskCache = { masked: m.masked, lastClosers: computeLastClosers(m.masked) };
+      // Fast path: with no backslash, backtick, bracket or angle bracket
+      // anywhere, no mask pass can change a character, so the masked text
+      // is the text itself.
+      if (!/[\\`[<]/.test(text)) {
+        maskCache = { masked: text, lastClosers: computeLastClosers(text) };
+      } else {
+        const m = maskText(text, refs);
+        maskCache = { masked: m.masked, lastClosers: computeLastClosers(m.masked) };
+      }
     }
     return maskCache;
   };
@@ -2306,7 +2406,7 @@ function renderBlock(b, refs, tight, ctx) {
       return '<pre><code' + cls + '>' + escapeHtml(content) + '</code></pre>\n';
     }
     case 'html':
-      return b.lines.join('\n') + (b.eofEnd ? '\n' : '');
+      return geTrim(b.lines.join('\n') + (b.eofEnd ? '\n' : ''));
     case 'hr':
       return '<hr>\n';
     case 'blockquote': {
